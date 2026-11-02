@@ -26,6 +26,8 @@ jobs:
           #app-id: ${{ secrets.APP_ID }}
           client-id: ${{ secrets.CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - uses: actions/checkout@v7
         with:
@@ -33,7 +35,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Merge PR branch into later releases + master branch
+      - name: Merge PR branch into later releases + main branch
         id: forward
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -205,7 +207,7 @@ jobs:
         if: steps.forward.outputs.failed != ''
         uses: cinotify/github-action@main
         with:
-          to: 'chandraarlagadda@nuvative.com'
+          to: 'StephenJehner@nuvative.com,NaveenRavindran@nuvative.com,AustinBrown@nuvative.com,chandraarlagadda@nuvative.com'
           subject: 'Forward merge stopped: PR #${{ github.event.pull_request.number }}'
           body: |
             PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.title }}) was merged into ${{ github.event.pull_request.base.ref }}, but the forward merge stopped at the first failure.
