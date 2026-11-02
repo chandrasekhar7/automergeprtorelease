@@ -1,0 +1,224 @@
+name: Hotfix_Branch_AutoMerge
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - 'release/**'
+permissions:
+  contents: read
+
+concurrency:
+  group: release-propagate
+  cancel-in-progress: false
+jobs:
+  propagate:
+    if: >
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          #app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ secrets.CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Merge PR branch into later releases + main branch
+        id: forward
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SOURCE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          MAIN_BRANCH: main
+        run: |
+          set -uo pipefail
+          git config user.name  "release-sync-bot"
+          git config user.email "release-sync-bot@users.noreply.github.com"
+          FAILED=""
+          SUCCEEDED=""
+          NOT_ATTEMPTED=""
+          REASONS=""
+          add_failed()    { FAILED="${FAILED:+$FAILED }$1"; REASONS="${REASONS:+$REASONS | }$1: $2"; }
+          add_succeeded() { SUCCEEDED="${SUCCEEDED:+$SUCCEEDED }$1"; }
+          write_outputs() {  # arg: completed (true|false)
+            {
+              echo "failed=$FAILED"
+              echo "succeeded=$SUCCEEDED"
+              echo "not_attempted=$NOT_ATTEMPTED"
+              echo "reasons=$REASONS"
+              echo "completed=$1"
+            } >> "$GITHUB_OUTPUT"
+          }
+          # Parse date from source branch name
+          SOURCE_DATE="${SOURCE_BRANCH##*/}"
+          PREFIX="${SOURCE_BRANCH%/*}/"
+          if ! [[ "$SOURCE_DATE" =~ ^[0-9]{8}$ ]]; then
+            echo "Branch '$SOURCE_BRANCH' does not end in YYYYMMDD, nothing to propagate"
+            write_outputs false
+            exit 0
+          fi
+          #Branches with the same prefix and a later date, oldest first
+          mapfile -t NEWER < <(
+            git ls-remote --heads origin "refs/heads/${PREFIX}*" \
+              | awk '{print $2}' | sed 's#^refs/heads/##' \
+              | grep -E "^${PREFIX}[0-9]{8}$" \
+              | awk -F/ -v src="$SOURCE_DATE" '$NF > src' \
+              | sort
+          )
+          TARGETS=("${NEWER[@]}")
+          if [ "$SOURCE_BRANCH" != "$MAIN_BRANCH" ]; then
+            TARGETS+=("$MAIN_BRANCH")
+          fi
+          echo "Source: $SOURCE_BRANCH (date $SOURCE_DATE), PR branch: $HEAD_BRANCH"
+          echo "Targets in order: ${TARGETS[*]}"
+          # returns 0 = merged, 1 = not merged
+          merge_pr() {
+            local pr="$1" state
+            gh pr merge "$pr" --repo "$REPO" --merge \
+              || gh pr merge "$pr" --repo "$REPO" --merge --admin \
+              || true
+            state=$(gh pr view "$pr" --repo "$REPO" --json state --jq .state 2>/dev/null || echo "")
+            [ "$state" = "MERGED" ]
+          }
+          # create a PR; falls back to an existing open one
+          open_pr() {  # args: target head title body
+            local target="$1" head="$2" title="$3" body="$4" url=""
+            if ! url=$(gh pr create --repo "$REPO" --base "$target" --head "$head" \
+                        --title "$title" --body "$body"); then
+              url=$(gh pr list --repo "$REPO" --head "$head" --base "$target" \
+                      --state open --json url --jq '.[0].url // empty') || url=""
+            fi
+            printf '%s' "$url"
+          }
+          # The PR branch must still exist
+          if ! git fetch origin "+refs/heads/$HEAD_BRANCH:refs/remotes/origin/$HEAD_BRANCH"; then
+            echo "PR branch '$HEAD_BRANCH' no longer exists"
+            add_failed "$HEAD_BRANCH" "PR branch no longer exists (turn off 'Automatically delete head branches')"
+            NOT_ATTEMPTED="${TARGETS[*]}"
+            write_outputs true
+            exit 0
+          fi
+
+          # Go in order and stop at the first problem, so a later branch
+          # never gets a change that an earlier branch is missing.
+          STOPPED_AT=-1
+          for i in "${!TARGETS[@]}"; do
+            TARGET="${TARGETS[$i]}"
+            [ -z "$TARGET" ] && continue
+            echo "=== Target: $TARGET ==="
+            if ! git fetch origin "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"; then
+              echo "Branch $TARGET not found on remote"
+              add_failed "$TARGET" "branch not found"
+              STOPPED_AT=$i
+              break
+            fi
+            # Already contained in the target? Nothing to do.
+            if git merge-base --is-ancestor "origin/$HEAD_BRANCH" "origin/$TARGET"; then
+              echo "Already in $TARGET, skipping"
+              continue
+            fi
+            # Throwaway merge to detect conflicts before opening a PR
+            git checkout -q --detach "origin/$TARGET"
+            if ! git merge --no-commit --no-ff "origin/$HEAD_BRANCH" >/dev/null 2>&1; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ',' | sed 's/,$//')
+              git merge --abort || true
+              echo "Conflict on $TARGET in: $CONFLICTS"
+              add_failed "$TARGET" "merge conflict in ${CONFLICTS:-unknown files}"
+              STOPPED_AT=$i
+              break
+            fi
+            git merge --abort 2>/dev/null || true
+            git reset -q --hard
+            SYNC_PR_URL=$(open_pr "$TARGET" "$HEAD_BRANCH" \
+              "[Sync] $PR_TITLE (#$PR_NUMBER) -> $TARGET" \
+              "Automated forward-port of \`$HEAD_BRANCH\` (PR #$PR_NUMBER, merged into \`$SOURCE_BRANCH\`) into \`$TARGET\`.")
+            if [ -z "${SYNC_PR_URL:-}" ]; then
+              echo "Could not create or find PR for $TARGET"
+              add_failed "$TARGET" "PR creation failed (check App Pull requests permission)"
+              STOPPED_AT=$i
+              break
+            fi
+            echo "PR: $SYNC_PR_URL"
+            if merge_pr "$SYNC_PR_URL"; then
+              add_succeeded "$TARGET"
+            else
+              echo "Merge failed for $TARGET"
+              add_failed "$TARGET" "merge blocked (ruleset/approval/checks)"
+              STOPPED_AT=$i
+              break
+            fi
+          done
+
+          # Everything after the failed branch was not touched
+          if [ "$STOPPED_AT" -ge 0 ]; then
+            NOT_ATTEMPTED="${TARGETS[*]:$((STOPPED_AT + 1))}"
+            echo "Stopped at ${TARGETS[$STOPPED_AT]}. Not attempted: ${NOT_ATTEMPTED:-none}"
+          fi
+          write_outputs true
+      - name: Delete original PR branch after successful propagation
+        # only when everything merged and the loop actually ran
+        if: >
+          steps.forward.outputs.completed == 'true' &&
+          steps.forward.outputs.failed == ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          case "$HEAD_BRANCH" in
+            master|main|release/*)
+              echo "Refusing to delete protected-looking branch: $HEAD_BRANCH"
+              exit 0 ;;
+          esac
+          if gh api -X DELETE "repos/$REPO/git/refs/heads/$HEAD_BRANCH"; then
+            echo "Deleted branch $HEAD_BRANCH"
+          else
+            echo "Branch $HEAD_BRANCH was not deleted (already removed or protected)"
+          fi
+      - name: Comment on original PR if propagation failed
+        if: steps.forward.outputs.failed != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          FAILED: ${{ steps.forward.outputs.failed }}
+          REASONS: ${{ steps.forward.outputs.reasons }}
+          SUCCEEDED: ${{ steps.forward.outputs.succeeded }}
+          NOT_ATTEMPTED: ${{ steps.forward.outputs.not_attempted }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
+          "Auto-propagation stopped at **$FAILED**. Details: $REASONS. Already merged: ${SUCCEEDED:-none}. Not attempted: ${NOT_ATTEMPTED:-none}. Branch \`$HEAD_BRANCH\` was kept. Resolve **$FAILED** first, then merge into the remaining branches in order."
+      - name: Email the team if something failed
+        if: steps.forward.outputs.failed != ''
+        uses: cinotify/github-action@main
+        with:
+          to: 'chandraarlagadda@nuvative.com'
+          subject: 'Forward merge stopped: PR #${{ github.event.pull_request.number }}'
+          body: |
+            PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.title }}) was merged into ${{ github.event.pull_request.base.ref }}, but the forward merge stopped at the first failure.
+            Branch: ${{ github.event.pull_request.head.ref }}
+            Stopped at: ${{ steps.forward.outputs.failed }}
+            Details: ${{ steps.forward.outputs.reasons }}
+            Already merged: ${{ steps.forward.outputs.succeeded }}
+            Not attempted: ${{ steps.forward.outputs.not_attempted }}
+            Resolve the stopped branch first, then merge into the remaining branches in order.
+            PR: ${{ github.event.pull_request.html_url }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Fail run on failure
+        if: steps.forward.outputs.failed != ''
+        run: exit 1
