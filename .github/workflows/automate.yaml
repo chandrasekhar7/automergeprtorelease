@@ -26,6 +26,8 @@ jobs:
           #app-id: ${{ secrets.APP_ID }}
           client-id: ${{ secrets.CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - uses: actions/checkout@v7
         with:
@@ -33,7 +35,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Merge PR branch into later releases + master branch
+      - name: Merge PR branch into later releases + main branch
         id: forward
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
