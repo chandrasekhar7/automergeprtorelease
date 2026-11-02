@@ -26,8 +26,6 @@ jobs:
           #app-id: ${{ secrets.APP_ID }}
           client-id: ${{ secrets.CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
 
       - uses: actions/checkout@v7
         with:
@@ -35,7 +33,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Merge PR branch into later releases + main branch
+      - name: Merge PR branch into later releases + master branch
         id: forward
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -113,7 +111,6 @@ jobs:
             write_outputs true
             exit 0
           fi
-
           # Go in order and stop at the first problem, so a later branch
           # never gets a change that an earlier branch is missing.
           STOPPED_AT=-1
@@ -163,7 +160,6 @@ jobs:
               break
             fi
           done
-
           # Everything after the failed branch was not touched
           if [ "$STOPPED_AT" -ge 0 ]; then
             NOT_ATTEMPTED="${TARGETS[*]:$((STOPPED_AT + 1))}"
