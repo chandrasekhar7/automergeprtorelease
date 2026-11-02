@@ -1,15 +1,18 @@
 name: Hotfix_Branch_AutoMerge
+
 on:
   pull_request:
     types: [closed]
     branches:
       - 'release/**'
+
 permissions:
   contents: read
 
 concurrency:
   group: release-propagate
   cancel-in-progress: false
+
 jobs:
   propagate:
     if: >
@@ -32,7 +35,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Merge PR branch into later releases + master branch
+      - name: Cherry-pick merged PR into later releases + master
         id: forward
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -41,6 +44,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
           SOURCE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           MAIN_BRANCH: master
         run: |
           set -uo pipefail
@@ -61,6 +65,7 @@ jobs:
               echo "completed=$1"
             } >> "$GITHUB_OUTPUT"
           }
+
           # Parse date from source branch name
           SOURCE_DATE="${SOURCE_BRANCH##*/}"
           PREFIX="${SOURCE_BRANCH%/*}/"
@@ -69,7 +74,8 @@ jobs:
             write_outputs false
             exit 0
           fi
-          #Branches with the same prefix and a later date, oldest first
+
+          # Branches with the same prefix and a later date, oldest first
           mapfile -t NEWER < <(
             git ls-remote --heads origin "refs/heads/${PREFIX}*" \
               | awk '{print $2}' | sed 's#^refs/heads/##' \
@@ -81,17 +87,33 @@ jobs:
           if [ "$SOURCE_BRANCH" != "$MAIN_BRANCH" ]; then
             TARGETS+=("$MAIN_BRANCH")
           fi
-          echo "Source: $SOURCE_BRANCH (date $SOURCE_DATE), PR branch: $HEAD_BRANCH"
+          echo "Source: $SOURCE_BRANCH (date $SOURCE_DATE), PR #$PR_NUMBER, commit: $MERGE_SHA"
           echo "Targets in order: ${TARGETS[*]}"
+
+          # The commit created when the PR was merged (squash commit) must exist
+          if [ -z "${MERGE_SHA:-}" ] || ! git cat-file -e "${MERGE_SHA}^{commit}" 2>/dev/null; then
+            echo "Merge commit '$MERGE_SHA' not found"
+            add_failed "$SOURCE_BRANCH" "merge commit of PR #$PR_NUMBER not found"
+            NOT_ATTEMPTED="${TARGETS[*]}"
+            write_outputs true
+            exit 0
+          fi
+
+          # If the PR was merged with a merge commit (2 parents), pick the mainline side
+          PARENT_COUNT=$(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w)   # sha + parents
+          PICK_OPTS=()
+          if [ "$PARENT_COUNT" -gt 2 ]; then
+            PICK_OPTS=(-m 1)
+          fi
+
           # returns 0 = merged, 1 = not merged
           merge_pr() {
             local pr="$1" state
-            gh pr merge "$pr" --repo "$REPO" --merge \
-              || gh pr merge "$pr" --repo "$REPO" --merge --admin \
-              || true
+            gh pr merge "$pr" --repo "$REPO" --squash || true
             state=$(gh pr view "$pr" --repo "$REPO" --json state --jq .state 2>/dev/null || echo "")
             [ "$state" = "MERGED" ]
           }
+
           # create a PR; falls back to an existing open one
           open_pr() {  # args: target head title body
             local target="$1" head="$2" title="$3" body="$4" url=""
@@ -102,14 +124,6 @@ jobs:
             fi
             printf '%s' "$url"
           }
-          # The PR branch must still exist
-          if ! git fetch origin "+refs/heads/$HEAD_BRANCH:refs/remotes/origin/$HEAD_BRANCH"; then
-            echo "PR branch '$HEAD_BRANCH' no longer exists"
-            add_failed "$HEAD_BRANCH" "PR branch no longer exists (turn off 'Automatically delete head branches')"
-            NOT_ATTEMPTED="${TARGETS[*]}"
-            write_outputs true
-            exit 0
-          fi
 
           # Go in order and stop at the first problem, so a later branch
           # never gets a change that an earlier branch is missing.
@@ -117,33 +131,49 @@ jobs:
           for i in "${!TARGETS[@]}"; do
             TARGET="${TARGETS[$i]}"
             [ -z "$TARGET" ] && continue
-            echo "=== Target: $TARGET ==="
+            SYNC_BRANCH="sync/pr-${PR_NUMBER}-to-${TARGET//\//-}"
+            echo "=== Target: $TARGET (sync branch: $SYNC_BRANCH) ==="
+
             if ! git fetch origin "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"; then
               echo "Branch $TARGET not found on remote"
               add_failed "$TARGET" "branch not found"
               STOPPED_AT=$i
               break
             fi
-            # Already contained in the target? Nothing to do.
-            if git merge-base --is-ancestor "origin/$HEAD_BRANCH" "origin/$TARGET"; then
-              echo "Already in $TARGET, skipping"
+
+            # Already forwarded by an earlier run? (squash merges keep no ancestry, so check the sync PR)
+            DONE=$(gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --base "$TARGET" \
+                     --state merged --json number --jq 'length' 2>/dev/null || echo 0)
+            if [ "${DONE:-0}" -gt 0 ]; then
+              echo "PR #$PR_NUMBER was already forwarded to $TARGET, skipping"
               continue
             fi
-            # Throwaway merge to detect conflicts before opening a PR
-            git checkout -q --detach "origin/$TARGET"
-            if ! git merge --no-commit --no-ff "origin/$HEAD_BRANCH" >/dev/null 2>&1; then
+
+            # Cherry-pick the squash commit onto a fresh sync branch based on the target
+            git checkout -q -B "$SYNC_BRANCH" "origin/$TARGET"
+            if ! git cherry-pick -x "${PICK_OPTS[@]}" "$MERGE_SHA" >/dev/null 2>&1; then
               CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ',' | sed 's/,$//')
-              git merge --abort || true
-              echo "Conflict on $TARGET in: $CONFLICTS"
-              add_failed "$TARGET" "merge conflict in ${CONFLICTS:-unknown files}"
+              if [ -z "$CONFLICTS" ] && git diff --cached --quiet; then
+                git cherry-pick --abort 2>/dev/null || true
+                echo "No changes needed on $TARGET (change already present), skipping"
+                continue
+              fi
+              git cherry-pick --abort 2>/dev/null || true
+              echo "Conflict on $TARGET in: ${CONFLICTS:-unknown files}"
+              add_failed "$TARGET" "cherry-pick conflict in ${CONFLICTS:-unknown files}"
               STOPPED_AT=$i
               break
             fi
-            git merge --abort 2>/dev/null || true
-            git reset -q --hard
-            SYNC_PR_URL=$(open_pr "$TARGET" "$HEAD_BRANCH" \
+
+            if ! git push --force origin "$SYNC_BRANCH"; then
+              add_failed "$TARGET" "could not push sync branch $SYNC_BRANCH"
+              STOPPED_AT=$i
+              break
+            fi
+
+            SYNC_PR_URL=$(open_pr "$TARGET" "$SYNC_BRANCH" \
               "[Sync] $PR_TITLE (#$PR_NUMBER) -> $TARGET" \
-              "Automated forward-port of \`$HEAD_BRANCH\` (PR #$PR_NUMBER, merged into \`$SOURCE_BRANCH\`) into \`$TARGET\`.")
+              "Automated cherry-pick of PR #$PR_NUMBER (commit \`$MERGE_SHA\`, merged into \`$SOURCE_BRANCH\`) into \`$TARGET\`.")
             if [ -z "${SYNC_PR_URL:-}" ]; then
               echo "Could not create or find PR for $TARGET"
               add_failed "$TARGET" "PR creation failed (check App Pull requests permission)"
@@ -151,8 +181,10 @@ jobs:
               break
             fi
             echo "PR: $SYNC_PR_URL"
+
             if merge_pr "$SYNC_PR_URL"; then
               add_succeeded "$TARGET"
+              gh api -X DELETE "repos/$REPO/git/refs/heads/$SYNC_BRANCH" >/dev/null 2>&1 || true
             else
               echo "Merge failed for $TARGET"
               add_failed "$TARGET" "merge blocked (ruleset/approval/checks)"
@@ -167,6 +199,7 @@ jobs:
             echo "Stopped at ${TARGETS[$STOPPED_AT]}. Not attempted: ${NOT_ATTEMPTED:-none}"
           fi
           write_outputs true
+
       - name: Delete original PR branch after successful propagation
         # only when everything merged and the loop actually ran
         if: >
@@ -187,35 +220,38 @@ jobs:
           else
             echo "Branch $HEAD_BRANCH was not deleted (already removed or protected)"
           fi
+
       - name: Comment on original PR if propagation failed
         if: steps.forward.outputs.failed != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           FAILED: ${{ steps.forward.outputs.failed }}
           REASONS: ${{ steps.forward.outputs.reasons }}
           SUCCEEDED: ${{ steps.forward.outputs.succeeded }}
           NOT_ATTEMPTED: ${{ steps.forward.outputs.not_attempted }}
         run: |
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
-          "Auto-propagation stopped at **$FAILED**. Details: $REASONS. Already merged: ${SUCCEEDED:-none}. Not attempted: ${NOT_ATTEMPTED:-none}. Branch \`$HEAD_BRANCH\` was kept. Resolve **$FAILED** first, then merge into the remaining branches in order."
+          "Auto-propagation stopped at **$FAILED**. Details: $REASONS. Already merged: ${SUCCEEDED:-none}. Not attempted: ${NOT_ATTEMPTED:-none}. To fix manually, cherry-pick commit \`$MERGE_SHA\` into **$FAILED** (git cherry-pick -x $MERGE_SHA), open a PR, then repeat for the remaining branches in order."
+
       - name: Email the team if something failed
         if: steps.forward.outputs.failed != ''
-        uses: cinotify/github-action@main
+        uses: cinotify/github-action@main   # TODO: pin to a commit SHA
         with:
           to: 'chandraarlagadda@nuvative.com'
           subject: 'Forward merge stopped: PR #${{ github.event.pull_request.number }}'
           body: |
             PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.title }}) was merged into ${{ github.event.pull_request.base.ref }}, but the forward merge stopped at the first failure.
-            Branch: ${{ github.event.pull_request.head.ref }}
+            Commit: ${{ github.event.pull_request.merge_commit_sha }}
             Stopped at: ${{ steps.forward.outputs.failed }}
             Details: ${{ steps.forward.outputs.reasons }}
             Already merged: ${{ steps.forward.outputs.succeeded }}
             Not attempted: ${{ steps.forward.outputs.not_attempted }}
-            Resolve the stopped branch first, then merge into the remaining branches in order.
+            Cherry-pick the commit into the stopped branch first, then into the remaining branches in order.
             PR: ${{ github.event.pull_request.html_url }}
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Fail run on failure
         if: steps.forward.outputs.failed != ''
         run: exit 1
