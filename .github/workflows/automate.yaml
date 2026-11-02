@@ -205,7 +205,7 @@ jobs:
         if: steps.forward.outputs.failed != ''
         uses: cinotify/github-action@main
         with:
-          to: 'StephenJehner@nuvative.com,NaveenRavindran@nuvative.com,AustinBrown@nuvative.com,chandraarlagadda@nuvative.com'
+          to: 'chandraarlagadda@nuvative.com'
           subject: 'Forward merge stopped: PR #${{ github.event.pull_request.number }}'
           body: |
             PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.title }}) was merged into ${{ github.event.pull_request.base.ref }}, but the forward merge stopped at the first failure.
