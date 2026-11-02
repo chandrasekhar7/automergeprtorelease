@@ -24,11 +24,8 @@ jobs:
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.APP_ID }}
-          client-id: ${{ secrets.CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: |
-            automergeprtorelease
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.ref }}
@@ -44,7 +41,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
           SOURCE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          MAIN_BRANCH: main
+          MAIN_BRANCH: master
         run: |
           set -uo pipefail
           git config user.name  "release-sync-bot"
@@ -113,6 +110,7 @@ jobs:
             write_outputs true
             exit 0
           fi
+
           # Go in order and stop at the first problem, so a later branch
           # never gets a change that an earlier branch is missing.
           STOPPED_AT=-1
@@ -162,6 +160,7 @@ jobs:
               break
             fi
           done
+
           # Everything after the failed branch was not touched
           if [ "$STOPPED_AT" -ge 0 ]; then
             NOT_ATTEMPTED="${TARGETS[*]:$((STOPPED_AT + 1))}"
